@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 import flask
-from flask import Flask, request
+from flask import Flask, request, redirect
 from flask_sockets import Sockets
 import gevent
 from gevent import queue
@@ -22,28 +22,33 @@ import time
 import json
 import os
 
-app = Flask(__name__)
+app = Flask(__name__,
+            static_url_path='/static',
+            static_folder='static')
+
 sockets = Sockets(app)
 app.debug = True
+clients = list()
+
 
 class World:
     def __init__(self):
         self.clear()
         # we've got listeners now!
         self.listeners = list()
-        
+
     def add_set_listener(self, listener):
-        self.listeners.append( listener )
+        self.listeners.append(listener)
 
     def update(self, entity, key, value):
-        entry = self.space.get(entity,dict())
+        entry = self.space.get(entity, dict())
         entry[key] = value
         self.space[entity] = entry
-        self.update_listeners( entity )
+        self.update_listeners(entity)
 
     def set(self, entity, data):
         self.space[entity] = data
-        self.update_listeners( entity )
+        self.update_listeners(entity)
 
     def update_listeners(self, entity):
         '''update the set listeners'''
@@ -54,34 +59,81 @@ class World:
         self.space = dict()
 
     def get(self, entity):
-        return self.space.get(entity,dict())
-    
+        return self.space.get(entity, dict())
+
     def world(self):
         return self.space
 
-myWorld = World()        
 
-def set_listener( entity, data ):
+myWorld = World()
+
+
+class Client:
+    def __init__(self):
+        self.queue = queue.Queue()
+
+    def put(self, v):
+        self.queue.put_nowait(v)
+
+    def get(self):
+        return self.queue.get()
+
+
+def set_listener(entity, data):
     ''' do something with the update ! '''
+    for client in clients:
+        json_data = json.dumps({entity: data})
+        client.put(json_data)
 
-myWorld.add_set_listener( set_listener )
-        
+myWorld.add_set_listener(set_listener)
+
+
 @app.route('/')
 def hello():
     '''Return something coherent here.. perhaps redirect to /static/index.html '''
-    return None
+    return redirect("/static/index.html", code=302)
 
-def read_ws(ws,client):
-    '''A greenlet function that reads from the websocket and updates the world'''
-    # XXX: TODO IMPLEMENT ME
-    return None
+
+def read_ws(ws, client):
+    """A greenlet function that reads from the websocket and updates the world"""
+    '''A greenlet function that reads from the websocket'''
+    try:
+        while True:
+            msg = ws.receive()
+            print(f"\nWS received msg: {json.loads(msg)}")
+            if msg is not None:
+                packet = json.loads(msg)
+                for k in packet.keys():
+                    myWorld.set(k, packet[k])
+            else:
+                break
+    except:
+        print("\nWS closed/done.")
+
 
 @sockets.route('/subscribe')
 def subscribe_socket(ws):
-    '''Fufill the websocket URL of /subscribe, every update notify the
-       websocket and read updates from the websocket '''
-    # XXX: TODO IMPLEMENT ME
-    return None
+    """
+    Fulfill the websocket URL of /subscribe, every update notify the
+    websocket and read updates from the websocket
+    """
+    client = Client()
+    clients.append(client)
+    g = gevent.spawn(read_ws, ws, client)
+
+    # bring the latest client in sync
+    curr_world = myWorld.world()
+    ws.send(json.dumps(curr_world))
+    try:
+        while True:
+            # block here
+            msg = client.get()
+            ws.send(msg)
+    except Exception as e:  # WebSocketError as e:
+        print(f"WS Error ${e}")
+    finally:
+        clients.remove(client)
+        gevent.kill(g)
 
 
 # I give this to you, this is how you get the raw body/data portion of a post in flask
@@ -89,34 +141,65 @@ def subscribe_socket(ws):
 def flask_post_json():
     '''Ah the joys of frameworks! They do so much work for you
        that they get in the way of sane operation!'''
-    if (request.json != None):
+    if request.json is not None:
         return request.json
-    elif (request.data != None and request.data.decode("utf8") != u''):
+    elif request.data is not None and request.data.decode("utf8") != u'':
         return json.loads(request.data.decode("utf8"))
     else:
         return json.loads(request.form.keys()[0])
 
-@app.route("/entity/<entity>", methods=['POST','PUT'])
+
+@app.route("/entity/<entity>", methods=['POST', 'PUT'])
 def update(entity):
     '''update the entities via this interface'''
-    return None
+    '''update the entities via this interface'''
+    data = flask_post_json()
 
-@app.route("/world", methods=['POST','GET'])    
+    if data.get("x", None) is None and data.get("y", None) is None:
+        return {"message": "invalid fields"}, 400
+
+    if request.method == 'PUT':
+        if data.get("x", None) is None or data.get("y", None) is None:
+            return {"message": "invalid fields"}, 400
+        myWorld.set(entity, {"x": data["x"], "y": data["y"]})
+        if data.get("colour", None) is not None:
+            myWorld.update(entity, "colour", data["colour"])
+        return myWorld.get(entity)
+
+    if data.get("x", None) is not None:
+        myWorld.update(entity, "x", data.get("x"))
+    if data.get("y", None) is not None:
+        myWorld.update(entity, "y", data.get("y"))
+    if data.get("colour", None) is not None:
+        myWorld.update(entity, "colour", data.get("colour"))
+
+    return myWorld.get(entity)
+
+
+@app.route("/world", methods=['POST', 'GET'])
 def world():
     '''you should probably return the world here'''
-    return None
+    '''you should probably return the world here'''
+    if request.method == 'GET':
+        return myWorld.world()
+    if request.method == 'POST':
+        data = flask_post_json()
+        for entity in data.keys():
+            myWorld.set(entity, {**data[entity]})
+        return myWorld.world()
 
-@app.route("/entity/<entity>")    
+
+@app.route("/entity/<entity>")
 def get_entity(entity):
     '''This is the GET version of the entity interface, return a representation of the entity'''
-    return None
+    return myWorld.get(entity)
 
 
-@app.route("/clear", methods=['POST','GET'])
+@app.route("/clear", methods=['POST', 'GET'])
 def clear():
     '''Clear the world out!'''
-    return None
-
+    myWorld.clear()
+    return myWorld.world()
 
 
 if __name__ == "__main__":
